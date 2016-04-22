@@ -4,6 +4,8 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 
+	"gopkg.in/ldap.v2"
+
 	"fmt"
 
 	"html/template"
@@ -15,11 +17,11 @@ import (
 	"time"
 
 	"github.com/coreos/dex/pkg/log"
+	"github.com/coreos/go-oidc/jose"
 	"github.com/coreos/go-oidc/oidc"
-
-	"gopkg.in/ldap.v2"
 )
 
+//LDAP type constants
 const (
 	LDAPConnectorType         = "ldap"
 	LDAPLoginPageTemplateName = "ldap-login.html"
@@ -29,6 +31,7 @@ func init() {
 	RegisterConnectorConfigType(LDAPConnectorType, func() ConnectorConfig { return &LDAPConnectorConfig{} })
 }
 
+//LDAPConnectorConfig is the configuration for an ldap connector
 type LDAPConnectorConfig struct {
 	ID                   string        `json:"id"`
 	ServerHost           string        `json:"serverHost"`
@@ -50,16 +53,25 @@ type LDAPConnectorConfig struct {
 	SearchBindPw         string        `json:"searchBindPw"`
 	BindTemplate         string        `json:"bindTemplate"`
 	TrustedEmailProvider bool          `json:"trustedEmailProvider"`
+
+	//Attributes is a map of string to string, where the keys are the LDAP source
+	//of additional claims and the values are the JWT destination claim names
+	Attributes map[string]string `json:"attributes"`
+	ldapAttrs  []string
 }
 
+//ConnectorID implements ConnectorConfig.ConnectorID
 func (cfg *LDAPConnectorConfig) ConnectorID() string {
 	return cfg.ID
 }
 
+//ConnectorType implements ConnectorConfig.ConnectorType
 func (cfg *LDAPConnectorConfig) ConnectorType() string {
 	return LDAPConnectorType
 }
 
+//LDAPConnector is the abstraction for connecting to an LDAP authentication and
+//attribute/claim storage backend
 type LDAPConnector struct {
 	id                   string
 	idp                  *LDAPIdentityProvider
@@ -154,12 +166,16 @@ func (cfg *LDAPConnectorConfig) Connector(ns url.URL, lf oidc.LoginFunc, tpls *t
 		tlsConfig.Certificates = []tls.Certificate{cert}
 	}
 
+	cfg.ldapAttrs = make([]string, 0, len(cfg.Attributes))
+	for key := range cfg.Attributes {
+		cfg.ldapAttrs = append(cfg.ldapAttrs, key)
+	}
 	idp := &LDAPIdentityProvider{
+		cfg:              *cfg,
 		serverHost:       cfg.ServerHost,
 		serverPort:       cfg.ServerPort,
 		useTLS:           cfg.UseTLS,
 		useSSL:           cfg.UseSSL,
-		baseDN:           cfg.BaseDN,
 		nameAttribute:    nameAttribute,
 		emailAttribute:   emailAttribute,
 		searchBeforeAuth: cfg.SearchBeforeAuth,
@@ -218,6 +234,7 @@ func (c *LDAPConnector) TrustedEmailProvider() bool {
 }
 
 type LDAPIdentityProvider struct {
+	cfg              LDAPConnectorConfig
 	serverHost       string
 	serverPort       uint16
 	useTLS           bool
@@ -260,17 +277,15 @@ func (m *LDAPIdentityProvider) LDAPConnect() (*ldap.Conn, error) {
 	return ldapConn, err
 }
 
+//ParseString parses config variables into the search string provided in the config.
 func (m *LDAPIdentityProvider) ParseString(template, username string) string {
-	result := template
-	result = strings.Replace(result, "%u", username, -1)
-	result = strings.Replace(result, "%b", m.baseDN, -1)
-
-	return result
+	return strings.NewReplacer("%u", username, "%b", m.cfg.BaseDN).Replace(template)
 }
 
 func (m *LDAPIdentityProvider) Identity(username, password string) (*oidc.Identity, error) {
 	var err error
 	var bindDN, ldapUid, ldapName, ldapEmail string
+	var claims jose.Claims
 	var ldapConn *ldap.Conn
 
 	ldapConn, err = m.LDAPConnect()
@@ -287,25 +302,28 @@ func (m *LDAPIdentityProvider) Identity(username, password string) (*oidc.Identi
 
 		filter := m.ParseString(m.searchFilter, username)
 
-		attributes := []string{
-			m.nameAttribute,
-			m.emailAttribute,
-		}
+		attributes := make([]string, 0, len(m.cfg.ldapAttrs)+2)
+		attributes = append(attributes, m.nameAttribute, m.emailAttribute)
+		attributes = append(attributes, m.cfg.ldapAttrs...)
 
-		s := ldap.NewSearchRequest(m.baseDN, m.searchScope, ldap.NeverDerefAliases, 0, 0, false, filter, attributes, nil)
+		s := ldap.NewSearchRequest(m.cfg.BaseDN, m.searchScope, ldap.NeverDerefAliases, 0, 0, false, filter, attributes, nil)
 
 		sr, err := ldapConn.Search(s)
 		if err != nil {
 			return nil, err
 		}
 		if len(sr.Entries) == 0 {
-			err = fmt.Errorf("Search returned no match. filter='%v' base='%v'", filter, m.baseDN)
+			err = fmt.Errorf("Search returned no match. filter='%v' base='%v'", filter, m.cfg.BaseDN)
 			return nil, err
 		}
 
 		bindDN = sr.Entries[0].DN
 		ldapName = sr.Entries[0].GetAttributeValue(m.nameAttribute)
 		ldapEmail = sr.Entries[0].GetAttributeValue(m.emailAttribute)
+
+		for _, attr := range sr.Entries[0].Attributes {
+			claims.Add(m.cfg.Attributes[attr.Name], attr.Values)
+		}
 
 		// drop to anonymous bind, prepare for bind as user
 		err = ldapConn.Bind("", "")
@@ -331,8 +349,9 @@ func (m *LDAPIdentityProvider) Identity(username, password string) (*oidc.Identi
 	ldapUid = bindDN
 
 	return &oidc.Identity{
-		ID:    ldapUid,
-		Name:  ldapName,
-		Email: ldapEmail,
+		ID:     ldapUid,
+		Name:   ldapName,
+		Email:  ldapEmail,
+		Claims: claims,
 	}, nil
 }
